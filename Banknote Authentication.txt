@@ -1,0 +1,196 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    average_precision_score
+)
+
+seed = 42
+np.random.seed(seed)
+tf.random.set_seed(seed)
+
+# =========================
+# CARGA DE DATOS
+# =========================
+url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00267/data_banknote_authentication.txt"
+cols = ["variance", "skewness", "curtosis", "entropy", "class"]
+data = pd.read_csv(url, header=None, names=cols)
+
+X = data.iloc[:, :-1].values.astype(np.float32)
+y = data.iloc[:, -1].values.astype(np.int32)
+
+print("Distribución de clases:", np.bincount(y))
+
+# =========================
+# SPLIT 70 / 15 / 15
+# =========================
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.30, stratify=y, random_state=seed
+)
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=seed
+)
+
+# =========================
+# ESCALAMIENTO
+# =========================
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
+X_test = scaler.transform(X_test)
+
+# =========================
+# PESOS DE CLASE
+# =========================
+classes = np.array([0, 1])
+weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+class_weight = {0: float(weights[0]), 1: float(weights[1])}
+
+# =========================
+# MODELO
+# =========================
+def create_model(input_dim):
+    inputs = tf.keras.Input(shape=(input_dim,))
+    x = tf.keras.layers.Dense(64, activation="relu")(inputs)
+    x = tf.keras.layers.Dropout(0.25)(x)
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.20)(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+    return tf.keras.Model(inputs, outputs)
+
+model = create_model(X_train.shape[1])
+
+metrics = [
+    tf.keras.metrics.AUC(curve="ROC", name="auc_roc"),
+    tf.keras.metrics.AUC(curve="PR", name="auc_pr"),
+    tf.keras.metrics.Recall(name="recall"),
+    tf.keras.metrics.Precision(name="precision")
+]
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3),
+    loss="binary_crossentropy",
+    metrics=metrics
+)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_auc_roc",
+        mode="max",
+        patience=20,
+        restore_best_weights=True
+    )
+]
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=300,
+    batch_size=32,
+    class_weight=class_weight,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# =========================
+# UMBRAL CON VALIDACIÓN
+# =========================
+pred_val = model.predict(X_val).ravel()
+thresholds = np.linspace(0.05, 0.95, 50)
+
+precision_values = []
+recall_values = []
+
+best_threshold = 0.5
+best_f1 = -1
+
+for t in thresholds:
+    y_val_pred = (pred_val >= t).astype(int)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_val, y_val_pred, average="binary", zero_division=0
+    )
+
+    precision_values.append(precision)
+    recall_values.append(recall)
+
+    if f1 > best_f1:
+        best_f1 = f1
+        best_threshold = t
+
+# =========================
+# TEST
+# =========================
+pred_test = model.predict(X_test).ravel()
+y_pred = (pred_test >= best_threshold).astype(int)
+
+cm = confusion_matrix(y_test, y_pred)
+precision, recall, f1, _ = precision_recall_fscore_support(
+    y_test, y_pred, average="binary", zero_division=0
+)
+
+auc_roc = roc_auc_score(y_test, pred_test)
+auc_pr = average_precision_score(y_test, pred_test)
+
+print("\nThreshold elegido:", best_threshold)
+print("Confusion Matrix:\n", cm)
+print("Precision:", precision)
+print("Recall:", recall)
+print("F1:", f1)
+print("ROC-AUC:", auc_roc)
+print("PR-AUC:", auc_pr)
+
+print("\nClassification Report:\n")
+print(classification_report(y_test, y_pred, target_names=["Authentic", "Forgery"], zero_division=0))
+
+# =========================
+# GRÁFICAS
+# =========================
+plt.figure()
+plt.plot(history.history["loss"], label="Train")
+plt.plot(history.history["val_loss"], label="Validation")
+plt.title("Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(history.history["auc_roc"], label="Train")
+plt.plot(history.history["val_auc_roc"], label="Validation")
+plt.title("AUC ROC")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(thresholds, precision_values, label="Precision")
+plt.plot(thresholds, recall_values, label="Recall")
+plt.axvline(best_threshold, linestyle="--", label=f"Best Threshold = {best_threshold:.2f}")
+plt.title("Precision / Recall vs Threshold")
+plt.xlabel("Threshold")
+plt.ylabel("Value")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.imshow(cm, cmap="Blues")
+plt.title("Confusion Matrix")
+plt.colorbar()
+plt.xticks([0, 1], ["Authentic", "Forgery"])
+plt.yticks([0, 1], ["Authentic", "Forgery"])
+plt.xlabel("Predicted")
+plt.ylabel("True")
+for i in range(2):
+    for j in range(2):
+        plt.text(j, i, cm[i, j], ha="center", va="center")
+plt.show()
